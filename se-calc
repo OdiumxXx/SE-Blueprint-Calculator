@@ -1,0 +1,871 @@
+#!/bin/bash
+#
+#
+set -e
+
+####################
+# CONFIGURATION
+####################
+
+# Leave blank to automatically detect where your steam library, Space Engineers game-files, and Space Engineers Blueprint files are stored.
+# Set manually only when automatic detection fails.
+#
+# Example/default file locations can be found below - your system may differ depending on your setup, confirm the locations before setting these variables.
+#
+# STEAM_LIBRARY="$HOME/.local/share/Steam"
+# GAME_DATA="$HOME/.local/share/Steam/steamapps/common/SpaceEngineers/Content/Data/CubeBlocks"
+# BLUEPRINTS_PATH="$HOME/.steam/debian-installation/steamapps/compatdata/244850/pfx/drive_c/users/steamuser/AppData/Roaming/SpaceEngineers/Blueprints/local/"
+
+STEAM_LIBRARY=""
+GAME_DATA=""
+BLUEPRINTS_PATH=""
+
+# PCU Overrides
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PCU_OVERRIDES="${SCRIPT_DIR}/se-pcu-overrides.conf"
+
+####################
+# END CONFIGURATION
+####################
+
+VERSION="SE Blueprint Calculator v3.0"
+
+####################
+# COLOUR VARIABLES
+####################
+
+# Terminal Formatting
+RESET="\033[0m"
+BOLD="\033[1m"
+
+# UI Colours
+CLR_RED="\033[38;5;196m"  # Bright Red
+CLR_GREEN="\033[38;5;46m" # Bright Lime Green
+
+CLR_GOLD="\033[38;5;226m"   # Gold
+CLR_PURPLE="\033[38;5;141m" # Purple
+CLR_PURPLE="\033[38;5;140m" # Light Purple / Lavender
+CLR_BLUE="\033[38;5;4m"     # Bright Sky Blue
+CLR_ORANGE="\033[38;5;208m" # Orange
+CLR_AQUA="\033[38;5;51m"    # Aqua
+CLR_PINK="\033[38;5;199m"   # PINK
+CLR_PBLUE="\033[38;5;147m"  # Pale Blue
+CLR_DGREEN="\033[38;5;2m"   # Dark Forest Green
+CLR_PAQUA="\033[38;5;195m"  # Pale Aqua
+CLR_GREY="\033[38;5;245m"   # Darker Grey
+CLR_TEXT="\033[38;5;253m"   # Light Grey
+
+######################
+# HELPER FUNCTIONS
+######################
+
+usage() {
+    echo
+    echo -e "${CLR_PURPLE}${BOLD}${VERSION}${RESET}"
+    echo
+    echo -e "${BOLD}Description:${RESET}"
+    echo -e "${CLR_TEXT}  Calculate the Component Requirements or PCU Cost for a Space Engineers blueprint.
+  Cross-references blueprint block types against the live game definitions.
+
+  Supports locally saved blueprints and automatically detects the Steam Library
+  and Space Engineers game files.${RESET}"
+    echo
+    echo -e "${BOLD}Usage:${RESET}"
+    echo -e "  ${CLR_TEXT}se-calc <command> [arguments]${RESET}"
+    echo
+
+    echo -e "${BOLD}Commands:${RESET}"
+    echo -e "${CLR_TEXT}"
+    echo -e "  list,   -l             ─── List locally saved Blueprints"
+    echo -e "  calc,   -c  <BP name>  ─── Calculate a blueprint's component requirements"
+    echo -e "  pcu,    -p  <BP name>  ─── Calculate a blueprint's PCU cost"
+    echo
+    echo -e "  steam,  -s             ─── List detected Steam Library and SE Game Path"
+    echo -e "  audit,  -a             ─── Audit game definitions for unresolved PCU values"
+    echo -e "  help,   -h             ─── Show this help"
+    echo -e "${RESET}"
+    echo
+
+    echo -e "${BOLD}Examples:${RESET}"
+    echo -e "${CLR_TEXT}  se-calc list"
+    echo -e "  se-calc -l"
+    echo -e "  se-calc -c M2-Barage"
+    echo -e "  se-calc -p M2-Barage"
+    echo -e "  se-calc -pcu M2-Barage${RESET}"
+    echo
+}
+
+error() {
+    echo -e "  ${CLR_RED}${BOLD}[Error]${RESET} $@ "
+}
+
+####################
+# EARLY HELP CHECK
+####################
+
+case "${1:-}" in
+    -h | --help | "")
+        usage
+        exit 0
+        ;;
+esac
+
+######################
+# AUTOMATIC DETECTION
+######################
+
+if [[ -z "$STEAM_LIBRARY" ]]; then
+
+    for STEAM_ROOT in \
+        "$HOME/.local/share/Steam" \
+        "$HOME/.steam/steam" \
+        "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"
+    do
+        VDF="$STEAM_ROOT/steamapps/libraryfolders.vdf"
+
+        if [[ -f "$VDF" ]]; then
+            while IFS= read -r LIBRARY; do
+                if [[ -f "$LIBRARY/steamapps/appmanifest_244850.acf" ]]; then
+                    STEAM_LIBRARY="$LIBRARY"
+                    break 2
+                fi
+            done < <(awk -F'"' '$2 == "path" {print $4}' "$VDF")
+        fi
+    done
+fi
+
+if [[ -z "$GAME_DATA" && -n "$STEAM_LIBRARY" ]]; then
+    GAME_DATA="$(find "$STEAM_LIBRARY/steamapps" \
+        -maxdepth 6 \
+        -type d \
+        -ipath '*/spaceengineers/content/data/cubeblocks' \
+        -print -quit)"
+fi
+
+if [[ -z "$BLUEPRINTS_PATH" && -n "$STEAM_LIBRARY" ]]; then
+    BLUEPRINTS_PATH="$STEAM_LIBRARY/steamapps/compatdata/244850/pfx/drive_c/users/steamuser/AppData/Roaming/SpaceEngineers/Blueprints/local/"
+fi
+
+####################
+# LIBRARY/GAME-FILE VALIDATION
+####################
+
+if [[ -z "$GAME_DATA" || ! -d "$GAME_DATA" ]]; then
+    echo
+    error "Space Engineers game data not found."
+    echo
+    exit 1
+fi
+
+####################
+# FUNCTIONS
+####################
+
+if ! command -v xmllint >/dev/null 2>&1; then
+    echo
+    error "xmllint not found. Install it (Debian/Ubuntu: libxml2-utils, Fedora: libxml2, Arch: libxml2)."
+    echo
+    exit 1
+fi
+
+
+####################
+# XML HELPERS (xmllint)
+####################
+
+# Abort if the blueprint is not well-formed XML.
+validate_blueprint() {
+    local bp="$1"
+
+    if ! xmllint --noout "$bp" 2>/dev/null; then
+        echo
+        error "Blueprint is not valid XML: ${CLR_TEXT}$bp${RESET}"
+        echo
+        exit 1
+    fi
+}
+
+# Print the SubtypeName of every block in a blueprint, one per line.
+# Covers every grid in the blueprint (including sub-grids).
+#
+# Some blocks (large O2/H2 generator, large O2 tank, gatling turret, ...) have
+# an empty <SubtypeName /> and are identified by their object type instead
+# (xsi:type="MyObjectBuilder_<TypeId>"). The game definitions for those blocks
+# have an empty <SubtypeId /> too, and definition_records() keys them the same
+# way, so both sides line up (and so do the keys in se-pcu-overrides.conf).
+#
+# $2 (optional) is an XPath predicate applied to each block, e.g. to select only
+# blocks that carry a <BuildPercent> element.
+blueprint_block_names() {
+    local bp="$1" pred="${2:-true()}" line
+
+    xmllint --xpath "//CubeGrid/CubeBlocks/*[${pred}]/SubtypeName/text()" "$bp" 2>/dev/null || true
+
+    xmllint --xpath "//CubeGrid/CubeBlocks/*[${pred}][not(normalize-space(SubtypeName))]/@*[local-name()=\"type\"]" "$bp" 2>/dev/null |
+    while IFS= read -r line; do
+        if [[ "$line" =~ type=\"MyObjectBuilder_([^\"]+)\" ]]; then
+            echo "${BASH_REMATCH[1]}"
+        fi
+    done || true
+}
+
+# Walk every game definition file and print one tagged record per line:
+#
+#   S|<key>                  start of a definition
+#   P|<pcu>                  <PCU> value of the current definition
+#   C|<component>|<count>    one <Component> of the current definition
+#
+# <key> is the SubtypeId, or - when the SubtypeId is empty - the TypeId
+# (e.g. OxygenGenerator, OxygenTank, LargeGatlingTurret).
+#
+# xmllint selects the nodes (in document order) and prints each one on a single
+# line, so layout / indentation of the source files does not matter.
+# $1 = XPath of the definitions to read (default: every <Definition>).
+definition_records() {
+    local scope="${1:-//Definition}"
+    local xpath="${scope}/Id/TypeId | ${scope}/Id/SubtypeId | ${scope}/Id[@TypeId or @Type or @SubtypeId or @Subtype][not(*)] | ${scope}/PCU | ${scope}/Components/Component"
+
+    local re_typeid_el='^<TypeId>(.*)</TypeId>$'
+    local re_subtype_el='^<SubtypeId>(.*)</SubtypeId>$'
+    local re_pcu='^<PCU>[[:space:]]*([0-9]+)[[:space:]]*</PCU>$'
+    local re_typeid='[[:space:]]TypeId="([^"]*)"'
+    local re_type='[[:space:]]Type="([^"]*)"'
+    local re_subtype_id='[[:space:]]SubtypeId="([^"]*)"'
+    local re_subtype='[[:space:]]Subtype="([^"]*)"'
+    local re_count='[[:space:]]Count="([^"]*)"'
+
+    local file
+
+    for file in "$GAME_DATA"/*.sbc; do
+        [[ -f "$file" ]] || continue
+
+        xmllint --xpath "$xpath" "$file" 2>/dev/null |
+        {
+            local line dtype="" dsub comp count
+
+            while IFS= read -r line; do
+                line="${line%$'\r'}"
+
+                if [[ "$line" =~ $re_typeid_el ]]; then
+                    dtype="${BASH_REMATCH[1]#MyObjectBuilder_}"
+
+                elif [[ "$line" =~ $re_subtype_el ]]; then
+                    echo "S|${BASH_REMATCH[1]:-$dtype}"
+                    dtype=""
+
+                elif [[ "$line" == "<SubtypeId/>" ]]; then
+                    echo "S|${dtype}"
+                    dtype=""
+
+                elif [[ "$line" == "<Id "* ]]; then
+                    # Compact form: <Id TypeId="..." SubtypeId="..." />
+                    # (alternate spelling: Type="..." Subtype="...")
+                    dtype="" dsub=""
+                    if [[ "$line" =~ $re_typeid ]]; then
+                        dtype="${BASH_REMATCH[1]#MyObjectBuilder_}"
+                    elif [[ "$line" =~ $re_type ]]; then
+                        dtype="${BASH_REMATCH[1]#MyObjectBuilder_}"
+                    fi
+                    if [[ "$line" =~ $re_subtype_id ]]; then
+                        dsub="${BASH_REMATCH[1]}"
+                    elif [[ "$line" =~ $re_subtype ]]; then
+                        dsub="${BASH_REMATCH[1]}"
+                    fi
+                    echo "S|${dsub:-$dtype}"
+                    dtype=""
+
+                elif [[ "$line" =~ $re_pcu ]]; then
+                    echo "P|${BASH_REMATCH[1]}"
+
+                elif [[ "$line" == "<Component "* ]]; then
+                    comp="" count=""
+                    if [[ "$line" =~ $re_subtype ]]; then comp="${BASH_REMATCH[1]}"; fi
+                    if [[ "$line" =~ $re_count ]]; then count="${BASH_REMATCH[1]}"; fi
+
+                    if [[ -n "$comp" && -n "$count" ]]; then
+                        echo "C|${comp}|${count}"
+                    fi
+                fi
+            done
+        } || true
+    done
+}
+
+# "<key>|<pcu>" for every definition. PCU defaults to 1 when the definition
+# has no (numeric) <PCU> element.
+definition_pcu_records() {
+    local tag a b current="" pcu=1
+
+    while IFS='|' read -r tag a b; do
+        case "$tag" in
+            S)
+                if [[ -n "$current" ]]; then echo "${current}|${pcu}"; fi
+                current="$a"
+                pcu=1
+                ;;
+            P)
+                pcu="$a"
+                ;;
+        esac
+    done < <(definition_records "$@")
+
+    if [[ -n "$current" ]]; then echo "${current}|${pcu}"; fi
+    return 0
+}
+
+# "<key>|<component>|<count>" for every component of every definition.
+definition_component_records() {
+    local tag a b current=""
+
+    while IFS='|' read -r tag a b; do
+        case "$tag" in
+            S) current="$a" ;;
+            C) if [[ -n "$current" ]]; then echo "${current}|${a}|${b}"; fi ;;
+        esac
+    done < <(definition_records "$@")
+
+    return 0
+}
+
+# One key per line for every definition.
+definition_block_ids() {
+    local tag a b
+
+    while IFS='|' read -r tag a b; do
+        if [[ "$tag" == "S" && -n "$a" ]]; then echo "$a"; fi
+    done < <(definition_records "$@")
+
+    return 0
+}
+
+list_paths() {
+    echo
+    echo -e "${CLR_ORANGE}Detected Steam Library and SE Game Paths${RESET}"
+    echo "──────────────────────────────"
+
+    echo -e "Steam Library:"
+    echo -e " ${CLR_PBLUE}${STEAM_LIBRARY}${RESET}"
+    echo
+
+    echo -e "Game Data:"
+    echo -e " ${CLR_PBLUE}${GAME_DATA}${RESET}"
+    echo
+
+    echo -e "Blueprints Path:"
+    echo -e " ${CLR_PBLUE}${BLUEPRINTS_PATH}${RESET}"
+
+    if [[ ! -d "$BLUEPRINTS_PATH" ]]; then
+        error "Space Engineers blueprint directory not found."
+        echo -e "  ${CLR_GOLD}Suggestion:${RESET} Are you sure you've saved a blueprint to this device before?"
+    fi
+
+    echo
+}
+
+cmd_pcu() {
+
+    local blueprint_name="$*"
+    local blueprint="${BLUEPRINTS_PATH}${blueprint_name}/bp.sbc"
+
+    if [[ ! -f "$blueprint" ]]; then
+        echo
+        error "Blueprint not found: ${CLR_TEXT}$blueprint${RESET}"
+        echo
+        exit 1
+    fi
+
+    if [[ ! -d "$GAME_DATA" ]]; then
+        echo
+        error "Space Engineers game data not found:"
+        echo -e "        ${CLR_TEXT}$GAME_DATA${RESET}"
+        echo
+        exit 1
+    fi
+
+    #
+    # Extract block counts from blueprint
+    #
+    validate_blueprint "$blueprint"
+
+    declare -A BLOCK_COUNTS
+
+    while read -r count block; do
+        BLOCK_COUNTS["$block"]="$count"
+    done < <(
+        blueprint_block_names "$blueprint" |
+        sort |
+        uniq -c |
+        sed 's/^[[:space:]]*//'
+    )
+
+    #
+    # Build PCU database from Space Engineers game definitions
+    # Uses the same <Id> / <SubtypeId> parser as the component calculator.
+    #
+    declare -A BLOCK_PCU
+
+    while IFS='|' read -r block pcu; do
+
+        [[ -z "$block" ]] && continue
+        [[ -z "$pcu" ]] && continue
+
+        BLOCK_PCU["$block"]="$pcu"
+
+    done < <(definition_pcu_records)
+
+    #
+    # Load PCU overrides for definitions which do not store <PCU> in XML.
+    # Override values take precedence over XML values.
+    #
+    if [[ -f "$PCU_OVERRIDES" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%%#*}"
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+
+            if [[ "$line" =~ ^[[:space:]]*([^=[:space:]]+)[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+                BLOCK_PCU["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+            fi
+        done < "$PCU_OVERRIDES"
+    fi
+
+    #
+    # Calculate PCU totals
+    #
+    declare -A PCU_TOTALS
+    declare -A PCU_PER_BLOCK
+    declare -A MISSING_PCU
+
+    #
+    # Blocks that were placed but never welded up to functionality only cost
+    # 1 PCU in-game. In a blueprint those carry a tiny <BuildPercent> (about
+    # 1.5E-05, i.e. 1/65536), which .NET writes in exponent notation.
+    #
+    declare -A UNWELDED_COUNTS
+    declare -A PARTIAL_COUNTS
+
+    while read -r count block; do
+        UNWELDED_COUNTS["$block"]="$count"
+    done < <(
+        blueprint_block_names "$blueprint" "contains(BuildPercent,'E-')" |
+        sort |
+        uniq -c |
+        sed 's/^[[:space:]]*//'
+    )
+
+    # Partly welded blocks (past "just placed") - whether they are already
+    # functional depends on the block, so these stay at full PCU and are only
+    # reported.
+    while read -r count block; do
+        PARTIAL_COUNTS["$block"]="$count"
+    done < <(
+        blueprint_block_names "$blueprint" "BuildPercent and not(contains(BuildPercent,'E-'))" |
+        sort |
+        uniq -c |
+        sed 's/^[[:space:]]*//'
+    )
+
+    for block in "${!BLOCK_COUNTS[@]}"; do
+
+        count="${BLOCK_COUNTS[$block]}"
+        pcu="${BLOCK_PCU[$block]:-}"
+
+        if [[ -z "$pcu" ]]; then
+            MISSING_PCU["$block"]="$count"
+            continue
+        fi
+
+        PCU_PER_BLOCK["$block"]="$pcu"
+        unwelded="${UNWELDED_COUNTS[$block]:-0}"
+        (( PCU_TOTALS["$block"] += pcu * (count - unwelded) + unwelded ))
+
+    done
+
+    # Calculate total blueprint PCU expense
+    TOTAL_BP_PCU=0
+
+    for block in "${!PCU_TOTALS[@]}"; do
+        (( TOTAL_BP_PCU += PCU_TOTALS["$block"] ))
+    done
+
+    #
+    # Output
+    #
+    echo
+    echo -e "${CLR_PURPLE}${BOLD} SE BLUEPRINT CALCULATOR${RESET}"
+    echo -e " ▶ ${BOLD}Blueprint:${RESET}${CLR_GOLD} ${blueprint_name} ${RESET}"
+    echo -e " ▶ ${BOLD}Total Blueprint PCU:${RESET}${CLR_GOLD} ${TOTAL_BP_PCU} ${RESET}"
+    echo
+
+    echo -e "${BOLD}${CLR_ORANGE}                       PCU Expenses${RESET}"
+    echo "─────────────────────────────────────────────────────────────"
+    printf "%b%-40s %8s %8s%b\n" "${BOLD}${CLR_PBLUE}" "Component" "PCU" "Per" "$RESET"
+    echo "─────────────────────────────────────────────────────────────"
+
+    while read -r block total pcu; do
+
+        label="$block"
+        label="${label#LargeBlock}"
+        label="${label#SmallBlock}"
+
+        case "$label" in
+            Gyro) label="Gyroscopes" ;;
+            Thrust) label="Thrusters" ;;
+            Drill) label="Drills" ;;
+            Welder) label="Welders" ;;
+            Grinder) label="Grinders" ;;
+            BatteryBlock) label="Batteries" ;;
+            Reactor) label="Reactors" ;;
+            Assembler) label="Assemblers" ;;
+            Refinery) label="Refineries" ;;
+            CargoContainer) label="Cargo Containers" ;;
+            Connector) label="Connectors" ;;
+            OreDetector) label="Ore Detectors" ;;
+            Antenna) label="Antennas" ;;
+            CameraBlock) label="Cameras" ;;
+            MergeBlock) label="Merge Blocks" ;;
+            PistonBase) label="Pistons" ;;
+            Rotor) label="Rotors" ;;
+            Stator) label="Stators" ;;
+        esac
+
+        printf "%-40s %8s %8s\n" "$label" "$total" "$pcu"
+        echo -e "${CLR_GREY}─────────────────────────────────────────────────────────────${RESET}"
+
+    done < <(
+        for block in "${!PCU_TOTALS[@]}"; do
+            printf "%s %s %s\n" "$block" "${PCU_TOTALS[$block]}" "${PCU_PER_BLOCK[$block]}"
+        done | sort -k2,2nr -k1,1
+    )
+
+    if [[ ${#UNWELDED_COUNTS[@]} -gt 0 ]]; then
+        echo
+        echo -e "${CLR_GOLD}${BOLD}NOTE:${RESET} Unwelded blocks count 1 PCU each (as in-game)"
+        echo "────────────────────────────────────────────"
+
+        for block in $(printf '%s\n' "${!UNWELDED_COUNTS[@]}" | sort); do
+            printf "  %-34s %3s x 1  (%s PCU when built)\n" \
+                "$block" \
+                "${UNWELDED_COUNTS[$block]}" \
+                "${BLOCK_PCU[$block]:-?}"
+        done
+    fi
+
+    #
+    # Partly welded blocks with a PCU above 1 - only these can change the total.
+    #
+    local partial_lines=""
+
+    for block in $(printf '%s\n' "${!PARTIAL_COUNTS[@]}" | sort); do
+        if (( ${BLOCK_PCU[$block]:-1} > 1 )); then
+            partial_lines+="$(printf "  %-34s %3s x  (%s PCU each)" "$block" "${PARTIAL_COUNTS[$block]}" "${BLOCK_PCU[$block]}")"$'\n'
+        fi
+    done
+
+    if [[ -n "$partial_lines" ]]; then
+        echo
+        echo -e "${CLR_GOLD}${BOLD}NOTE:${RESET} Partly welded blocks counted at full PCU"
+        echo "────────────────────────────────────────────"
+        printf '%s' "$partial_lines"
+        echo -e "${CLR_GREY}  In-game these count 1 PCU if still below their functional point.${RESET}"
+    fi
+
+    if [[ ${#MISSING_PCU[@]} -gt 0 ]]; then
+        echo
+        echo -e "${CLR_GOLD}${BOLD}WARNING:${RESET} Blocks not found in game PCU definitions"
+        echo "────────────────────────────────────────────"
+
+        for block in $(printf '%s\n' "${!MISSING_PCU[@]}" | sort); do
+            printf "  %-25s %6s\n" \
+                "$block" \
+                "${MISSING_PCU[$block]}"
+        done
+    fi
+
+    echo
+}
+
+cmd_calculate() {
+
+    local blueprint_name="$*"
+    local blueprint="${BLUEPRINTS_PATH}${blueprint_name}/bp.sbc"
+
+    if [[ ! -f "$blueprint" ]]; then
+        echo
+        error "Blueprint not found: ${CLR_TEXT}$blueprint${RESET}"
+        echo
+        exit 1
+    fi
+
+    if [[ ! -d "$GAME_DATA" ]]; then
+        echo
+        error "Space Engineers game data not found:"
+        echo -e "        ${CLR_TEXT}$GAME_DATA${RESET}"
+        echo
+        exit 1
+    fi
+
+    #
+    # Extract block counts from blueprint
+    #
+    validate_blueprint "$blueprint"
+
+    declare -A BLOCK_COUNTS
+
+    while read -r count block; do
+        BLOCK_COUNTS["$block"]="$count"
+    done < <(
+        blueprint_block_names "$blueprint" |
+        sort |
+        uniq -c |
+        sed 's/^[[:space:]]*//'
+    )
+
+    #
+    # Build component database from Space Engineers game files
+    #
+    declare -A BLOCK_COMPONENTS
+
+    while IFS='|' read -r block component quantity; do
+
+        [[ -z "$block" ]] && continue
+        [[ -z "$component" ]] && continue
+        [[ -z "$quantity" ]] && continue
+
+        BLOCK_COMPONENTS["$block"]+="${component}|${quantity}"$'\n'
+
+    done < <(definition_component_records)
+
+    #
+    # Calculate component totals
+    #
+    declare -A COMPONENT_TOTALS
+    declare -A MISSING_BLOCKS
+
+    for block in "${!BLOCK_COUNTS[@]}"; do
+
+        count="${BLOCK_COUNTS[$block]}"
+
+        if [[ -z "${BLOCK_COMPONENTS[$block]:-}" ]]; then
+            MISSING_BLOCKS["$block"]="$count"
+            continue
+        fi
+
+        while IFS='|' read -r component quantity; do
+
+            [[ -z "$component" ]] && continue
+
+            (( COMPONENT_TOTALS["$component"] += quantity * count ))
+
+        done <<< "${BLOCK_COMPONENTS[$block]}"
+
+    done
+
+    #
+    # Output
+    #
+    echo
+    echo -e "${CLR_PURPLE}${BOLD} SE BLUEPRINT CALCULATOR${RESET}"
+    echo -e " ▶ ${BOLD}Blueprint:${RESET}${CLR_GOLD} ${blueprint_name} ${RESET}"
+    echo
+    echo -e "${CLR_ORANGE}${BOLD}          Component Requirements${RESET}"
+    echo "────────────────────────────────────────────"
+    printf "%b%-25s %12s%b\n" "${BOLD}${CLR_PBLUE}" "  Component" "Required" "$RESET"
+    echo "────────────────────────────────────────────"
+
+    while read -r component quantity; do
+        printf "%-25s %12s\n" \
+            " • $component" \
+            "$quantity"
+        echo -e "${CLR_GREY}────────────────────────────────────────────${RESET}"
+    done < <(
+        for component in "${!COMPONENT_TOTALS[@]}"; do
+            printf "%s %s\n" "$component" "${COMPONENT_TOTALS[$component]}"
+        done | sort -k2,2nr -k1,1
+    )
+
+    if [[ ${#MISSING_BLOCKS[@]} -gt 0 ]]; then
+        echo
+        echo -e "${CLR_GOLD}${BOLD}WARNING:${RESET} Blocks not found in game definitions"
+        echo "────────────────────────────────────────────"
+
+        for block in $(printf '%s\n' "${!MISSING_BLOCKS[@]}" | sort); do
+            printf "  %-25s %6s\n" \
+                "$block" \
+                "${MISSING_BLOCKS[$block]}"
+        done
+    fi
+
+    echo
+}
+
+audit_pcu() {
+
+    echo
+    echo "────────────────────────────────────────────"
+    echo -e "             ${BOLD}${CLR_ORANGE}PCU Audit${RESET}"
+    echo "────────────────────────────────────────────"
+    echo -e " ▶ ${CLR_PBLUE}Scanning installed Space Engineers game definitions${RESET}"
+    echo
+
+    if [[ ! -d "$GAME_DATA" ]]; then
+        error "Space Engineers game data not found:"
+        echo -e "        ${CLR_TEXT}$GAME_DATA${RESET}"
+        echo
+        exit 1
+    fi
+
+    #
+    # Build the same PCU database used by the calculator.
+    #
+    declare -A BLOCK_PCU
+
+    while IFS='|' read -r block pcu; do
+
+        [[ -z "$block" ]] && continue
+        [[ -z "$pcu" ]] && continue
+
+        BLOCK_PCU["$block"]="$pcu"
+
+    done < <(definition_pcu_records)
+
+    #
+    # Build a list of actual CubeBlock definitions only.
+    # Other SBC definitions (such as Scrap / PrototechScrap) can contain
+    # SubtypeId values but are not buildable blocks and must not be audited.
+    #
+    declare -A ALL_BLOCKS
+
+    while IFS= read -r block; do
+
+        [[ -z "$block" ]] && continue
+        ALL_BLOCKS["$block"]=1
+
+    done < <(definition_block_ids "/Definitions/CubeBlocks/Definition" | sort -u)
+
+    #
+    # Load PCU overrides. Any block already covered there is considered
+    # resolved for audit purposes.
+    #
+    declare -A PCU_OVERRIDE_BLOCKS
+
+    if [[ -f "$PCU_OVERRIDES" ]]; then
+
+        while IFS= read -r line || [[ -n "$line" ]]; do
+
+            line="${line%%#*}"
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+
+            if [[ "$line" =~ ^[[:space:]]*([^=[:space:]]+)[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+                PCU_OVERRIDE_BLOCKS["${BASH_REMATCH[1]}"]=1
+            fi
+
+        done < "$PCU_OVERRIDES"
+    fi
+
+    #
+    # Find every installed definition that the calculator cannot currently
+    # resolve through its XML PCU parser or an override.
+    #
+    declare -a UNRESOLVED=()
+
+    for block in "${!ALL_BLOCKS[@]}"; do
+
+        if [[ -z "${BLOCK_PCU[$block]:-}" &&
+              -z "${PCU_OVERRIDE_BLOCKS[$block]:-}" ]]; then
+
+            UNRESOLVED+=("$block")
+
+        fi
+
+    done
+
+    if [[ ${#UNRESOLVED[@]} -eq 0 ]]; then
+        echo -e "${CLR_GREEN}${BOLD}No unresolved PCU definitions found.${RESET}"
+        echo
+        return 0
+    fi
+
+    echo -e "${CLR_GOLD}${BOLD}WARNING:${RESET} Blocks not currently resolved by the PCU calculator"
+    echo "────────────────────────────────────────────"
+
+    for block in $(printf '%s\n' "${UNRESOLVED[@]}" | sort); do
+
+        printf "  %-40s" "$block"
+
+        counterpart=""
+
+        case "$block" in
+            LargeBlock*)
+                counterpart="SmallBlock${block#LargeBlock}"
+                ;;
+            SmallBlock*)
+                counterpart="LargeBlock${block#SmallBlock}"
+                ;;
+        esac
+
+        if [[ -n "$counterpart" &&
+              -n "${ALL_BLOCKS[$counterpart]:-}" &&
+              -z "${BLOCK_PCU[$counterpart]:-}" &&
+              -z "${PCU_OVERRIDE_BLOCKS[$counterpart]:-}" ]]; then
+
+            echo -e "${CLR_GOLD}↔ unresolved counterpart: ${counterpart}${RESET}"
+
+        else
+            echo
+
+        fi
+
+    done
+
+    echo
+    echo -e "${CLR_GREY}Add confirmed PCU values to:${RESET}"
+    echo -e "  ${CLR_PBLUE}${PCU_OVERRIDES}${RESET}"
+    echo
+}
+
+list_blueprints() {
+
+    echo
+    echo -e "             ${BOLD}${CLR_ORANGE}Local Blueprints${RESET}"
+    echo "──────────────────────────────────────────────────────────────────────────────────────────────────"
+    echo -e " ▶ ${CLR_PBLUE}${BLUEPRINTS_PATH} ${RESET}"
+    echo "──────────────────────────────────────────────────────────────────────────────────────────────────"
+    echo
+
+    ls "${BLUEPRINTS_PATH}"
+    echo
+}
+
+####################
+# COMMANDS
+####################
+
+case "${1:-}" in
+    -s | --steam)
+        list_paths
+        ;;
+
+    -l | --list)
+        list_blueprints
+        ;;
+
+    -p | -pcu | --pcu)
+        shift
+        [[ $# -eq 0 ]] && usage
+        cmd_pcu "$@"
+        ;;
+
+    audit | -a | --audit)
+        audit_pcu
+        ;;
+
+    -c | calc)
+        shift
+        [[ $# -eq 0 ]] && usage
+        cmd_calculate "$@"
+        ;;
+
+    -*)
+        usage
+        ;;
+esac
