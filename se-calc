@@ -28,7 +28,7 @@ PCU_OVERRIDES="${SCRIPT_DIR}/se-pcu-overrides.conf"
 # END CONFIGURATION
 ####################
 
-VERSION="SE Blueprint Calculator v3.0"
+VERSION="SE Blueprint Calculator v3.1.0"
 
 ####################
 # COLOUR VARIABLES
@@ -79,6 +79,7 @@ usage() {
     echo -e "  list,   -l             ─── List locally saved Blueprints"
     echo -e "  calc,   -c  <BP name>  ─── Calculate a blueprint's component requirements"
     echo -e "  pcu,    -p  <BP name>  ─── Calculate a blueprint's PCU cost"
+    echo -e "  find,   -f  <BP name>  ─── Find a particular blueprint via grep search-term"
     echo
     echo -e "  steam,  -s             ─── List detected Steam Library and SE Game Path"
     echo -e "  audit,  -a             ─── Audit game definitions for unresolved PCU values"
@@ -89,6 +90,8 @@ usage() {
     echo -e "${BOLD}Examples:${RESET}"
     echo -e "${CLR_TEXT}  se-calc list"
     echo -e "  se-calc -l"
+    echo -e "  se-calc -f barage"
+    echo
     echo -e "  se-calc -c M2-Barage"
     echo -e "  se-calc -p M2-Barage"
     echo -e "  se-calc -pcu M2-Barage${RESET}"
@@ -836,6 +839,17 @@ list_blueprints() {
     echo
 }
 
+find_blueprint() {
+
+    echo
+    echo -e "       ${BOLD}${CLR_ORANGE}Blueprint Lookup${RESET}"
+    echo "───────────────────────────────"
+    echo
+
+    ls "${BLUEPRINTS_PATH}" | grep -i $@
+    echo
+}
+
 ####################
 # COMMANDS
 ####################
@@ -863,6 +877,11 @@ case "${1:-}" in
         shift
         [[ $# -eq 0 ]] && usage
         cmd_calculate "$@"
+        ;;
+    -f | find)
+        shift
+        [[ $# -eq 0 ]] && usage
+        find_blueprint "$@"
         ;;
 
     -*)
